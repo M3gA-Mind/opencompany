@@ -205,7 +205,8 @@ statement about that host rather than a debt. Against a gated one they run:
 To run them:
 
 ```sh
-cargo build --locked --features openhuman,tinycortex,mcp --bin opencompany
+cargo build --locked --features openhuman,tinycortex,mcp --bin opencompany  # repo root
+cd frontend
 npm run e2e:live                         # PW_LIVE_BRAIN=1 npm run e2e
 ```
 
