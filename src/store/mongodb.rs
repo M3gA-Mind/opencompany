@@ -32,6 +32,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -116,6 +117,22 @@ pub struct MongoStore {
     db: Database,
     senders: Arc<StdMutex<HashMap<CompanyId, broadcast::Sender<StoredEvent>>>>,
 }
+
+/// How recently a workspace blob must have been uploaded for
+/// [`sweep_orphan_blobs`](MongoStore::sweep_orphan_blobs) to leave it alone
+/// (issue #664).
+///
+/// This is the window in which a blob legitimately has no node: `create_binary`
+/// uploads the payload and inserts the node as two statements, and a sweep
+/// running in between sees a healthy upload as garbage.
+///
+/// An hour rather than a second because the two failure directions are not
+/// symmetric. Too short and a slow or contended write loses its payload with no
+/// way to recover it. Too long and an orphan from a genuine crash occupies disk
+/// until a later boot reclaims it — which is the outcome this sweep exists to
+/// produce anyway, just later. When only one direction is destructive, the
+/// margin belongs on the other side.
+const INFLIGHT_BLOB_GRACE: Duration = Duration::from_secs(60 * 60);
 
 impl MongoStore {
     /// Connects to `uri` and opens `db_name`, creating the port indexes.
@@ -2140,6 +2157,17 @@ impl MongoStore {
     /// returned anyway, because refusing to open a company's storage over
     /// reclaimable disk would trade an invisible cost for a total outage.
     async fn sweep_orphan_blobs(&self) -> Result<u64> {
+        self.sweep_orphan_blobs_before(SystemTime::now() - INFLIGHT_BLOB_GRACE)
+            .await
+    }
+
+    /// [`sweep_orphan_blobs`](Self::sweep_orphan_blobs) with the cutoff supplied
+    /// rather than derived from the clock.
+    ///
+    /// Split out so a test can state which side of the grace a blob is on
+    /// instead of sleeping for an hour, and so the production path has exactly
+    /// one place the grace is applied.
+    async fn sweep_orphan_blobs_before(&self, cutoff: SystemTime) -> Result<u64> {
         let live: std::collections::HashSet<(String, String)> = {
             let mut cursor = self
                 .collection("workspace_nodes")
@@ -2158,7 +2186,33 @@ impl MongoStore {
         let bucket = self.blobs();
         let mut cursor = bucket.find(doc! {}).await.map_err(mongo_err)?;
         let mut removed = 0;
+        // Issue #664: a blob younger than this is NOT swept, however orphaned it
+        // looks.
+        //
+        // `create_binary` uploads the blob and inserts the node as two
+        // statements, so between them a perfectly healthy upload IS an orphan by
+        // this scan's definition. The scan is unfiltered by company — correctly,
+        // since it must reclaim for every company in the database — so any
+        // process booting here would delete an in-flight upload belonging to any
+        // company, including one being written by a different process against
+        // the same database (a rolling deploy, an overlapping wake-on-request
+        // restart, shared-single-DB tenancy). The victim keeps a node whose blob
+        // 404s forever while its recorded `size` still counts against the quota.
+        //
+        // A `company_id` filter does not fix this and was the tempting wrong
+        // answer: the store serves every company in its database and holds no
+        // tenant identity, and the same-process race survives any such filter.
+        // The race is about TIME, so the guard is about time.
+        //
+        // Erring is one-directional on purpose. Skipping a genuine orphan costs
+        // disk until the next boot sweeps it; deleting a live upload destroys a
+        // deliverable the operator will never get back. An hour is far longer
+        // than the gap between two adjacent statements and far shorter than the
+        // interval between boots that matters.
         while let Some(file) = cursor.try_next().await.map_err(mongo_err)? {
+            if file.upload_date.to_system_time() > cutoff {
+                continue;
+            }
             let key = file.metadata.as_ref().and_then(|m| {
                 Some((
                     m.get_str("company_id").ok()?.to_string(),
@@ -2786,6 +2840,12 @@ mod test {
             "two orphans and one live payload are staged"
         );
 
+        // Age every blob past the in-flight grace (issue #664). Without this the
+        // sweep spares all three — correctly, since a blob seconds old may be a
+        // write in progress — and this test would assert nothing. Backdating is
+        // what makes it a test about *orphans* rather than about the clock.
+        backdate_blobs(&s).await;
+
         // Constructing a store over the same database runs the sweep.
         let rebooted = MongoStore::from_database(s.db.clone()).await.unwrap();
 
@@ -2815,6 +2875,79 @@ mod test {
             }
         }
         assert_eq!(got, b"live-bytes".to_vec());
+
+        drop_db(&s).await;
+    }
+
+    /// Moves every blob's `uploadDate` an hour and a half into the past, so the
+    /// in-flight grace (issue #664) no longer covers it.
+    ///
+    /// Reaches into the GridFS files collection directly because the bucket API
+    /// offers no way to age an upload, and the alternative — sleeping past the
+    /// grace — would put an hour into the suite.
+    async fn backdate_blobs(store: &MongoStore) {
+        let old = mongodb::bson::DateTime::from_system_time(
+            SystemTime::now() - Duration::from_secs(90 * 60),
+        );
+        store
+            .db
+            .collection::<Document>(&format!("{BLOB_BUCKET}.files"))
+            .update_many(doc! {}, doc! {"$set": {"uploadDate": old}})
+            .await
+            .expect("backdating the staged blobs");
+    }
+
+    /// Issue #664. A blob uploaded moments ago is NOT reclaimed, however
+    /// orphaned it looks.
+    ///
+    /// This is the state `create_binary` passes through on every binary write:
+    /// the payload is uploaded, and for the width of one insert there is no node
+    /// pointing at it. A sweep running in that window — a rolling deploy, an
+    /// overlapping wake-on-request restart, another tenant booting against a
+    /// shared database — used to delete it, leaving a node whose download 404s
+    /// forever while its recorded size still counted against the quota.
+    ///
+    /// The sweep is deliberately not filtered by company, because it must
+    /// reclaim for every company in the database. That is exactly why the guard
+    /// has to be about time rather than about ownership.
+    #[tokio::test]
+    async fn the_boot_sweep_leaves_an_in_flight_upload_alone() {
+        let Some(s) = store().await else { return };
+        let company = CompanyId::new("inflight-co");
+
+        // Precisely the intermediate state of `create_binary`: bytes uploaded,
+        // node document not yet inserted.
+        s.put_blob(&company, "in-flight", "uploading.png", b"half-written")
+            .await
+            .unwrap();
+
+        // A second process boots against the same database and sweeps.
+        let rebooted = MongoStore::from_database(s.db.clone()).await.unwrap();
+
+        let files = rebooted
+            .blobs()
+            .find(doc! {})
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "an upload younger than the grace must survive a concurrent boot sweep"
+        );
+        assert_eq!(files[0].filename.as_deref(), Some("uploading.png"));
+
+        // And the control: once it is genuinely old, it IS reclaimed — so the
+        // guard delays reclamation rather than abandoning it, and this test
+        // cannot pass against a sweep that simply stopped deleting.
+        backdate_blobs(&s).await;
+        let removed = rebooted
+            .sweep_orphan_blobs()
+            .await
+            .expect("the sweep runs again");
+        assert_eq!(removed, 1, "an aged orphan is still reclaimed");
 
         drop_db(&s).await;
     }
