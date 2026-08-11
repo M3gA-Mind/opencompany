@@ -419,6 +419,7 @@ async fn add_member(
         name: body.name,
         role: body.role,
         description: body.description,
+        tools: Vec::new(),
     };
     record.overlay_agents.push(agent.clone());
     let attribution = author.map(|admin| BudgetOverride {

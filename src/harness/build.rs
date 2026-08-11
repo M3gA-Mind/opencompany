@@ -601,6 +601,14 @@ pub fn build_agent(
             // the `read_run_output` companion reads back, so a clipped preview
             // is reachable within the turn. Orchestrator-only, like the tools.
             deps.run_outputs.clone(),
+            // Issue #619: this agent's own id and effective grant, so
+            // `add_agent` cannot mint a teammate wider than the agent minting
+            // it. `grants` is already intersected against `[tools].allow` by
+            // `agent_effective_grants`, so it is the resolved answer rather than
+            // the requested one — and because this block is
+            // orchestrator-only, the minting agent is unambiguous.
+            manifest_agent.id.clone(),
+            grants.to_vec(),
         ));
     }
 

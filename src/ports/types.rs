@@ -2111,6 +2111,26 @@ pub struct OverlayAgent {
     /// An optional description of the teammate's mandate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The tool globs this teammate asks for — the overlay equivalent of a
+    /// manifest `[[agent]].tools` line (issue #619).
+    ///
+    /// Before this field existed an overlay teammate could not be scoped at
+    /// all: both readers projected it to an empty list, and **empty means "the
+    /// company's standard grant"**, not "no tools". So every operator-added
+    /// teammate permanently held everything the company held, and there was
+    /// nowhere to write anything narrower.
+    ///
+    /// Empty still means inherit — that rule is #264's and is deliberately
+    /// unchanged. What changes is only that a non-empty value can now be
+    /// *written*. Resolution against the company allow-list is unchanged too:
+    /// [`agent_effective_grants`](crate::runtime::builder::agent_effective_grants)
+    /// intersects this with `[tools].allow`, so a teammate can be narrowed but
+    /// never widened past the company ceiling.
+    ///
+    /// `skip_serializing_if` keeps the field additive: a record written before
+    /// this existed round-trips byte-identically, and reads back as "inherit".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
 }
 
 /// An operator-added desk membership that the version-controlled manifest does
@@ -3852,6 +3872,7 @@ mod test {
             name: "Nova".into(),
             role: "Growth".into(),
             description: None,
+            tools: Vec::new(),
         });
         assert!(record.is_roster_agent("ceo"));
         assert!(record.is_roster_agent("nova"));
@@ -4051,6 +4072,7 @@ mod test {
             name: "Shane".to_string(),
             role: "Growth".to_string(),
             description: None,
+            tools: Vec::new(),
         });
         assert_eq!(record.effective_budget("shane"), None);
 

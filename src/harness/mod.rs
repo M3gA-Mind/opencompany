@@ -1837,6 +1837,20 @@ fn overlay_fingerprint(agents: &[OverlayAgent]) -> u64 {
         agent.name.hash(&mut hasher);
         agent.role.hash(&mut hasher);
         agent.description.hash(&mut hasher);
+        // Issue #619. Without this the scoping feature is a no-op until the
+        // process restarts, and it fails in the dangerous direction: the roster
+        // is cached and rebuilt only when a fingerprint moves, so narrowing a
+        // teammate would persist, return 200, render in the console — and leave
+        // that teammate still holding the company's widest grant. The console
+        // would say "read-only" and the agent would not be.
+        //
+        // Hashed in order and with its length folded in by the `len()` above,
+        // for the same reason the policy override's list is: a grant list is
+        // the operator's own, not an accumulation of independent rows.
+        agent.tools.len().hash(&mut hasher);
+        for tool in &agent.tools {
+            tool.hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -2047,7 +2061,12 @@ fn overlay_agent_to_manifest(overlay: &OverlayAgent) -> ManifestAgent {
         role: overlay.role.clone(),
         description: overlay.description.clone(),
         tier: None,
-        tools: Vec::new(),
+        // Issue #619: the overlay's own line, not a hardcoded empty list.
+        // Empty still means "the company's standard grant" (#264) — this only
+        // makes a narrower value expressible. Must stay in lockstep with
+        // `server::ops::team_agent::requested_grants`, or the console renders a
+        // grant the harness does not honour.
+        tools: overlay.tools.clone(),
         budget_usd_daily: None,
     }
 }
@@ -2385,6 +2404,7 @@ description = "Builds the product."
             name: "Jamie".into(),
             role: "Growth Lead".into(),
             description: Some("Owns acquisition experiments.".into()),
+            tools: Vec::new(),
         });
 
         let roster = build_roster(&rec, &fx.deps, &[]).expect("roster builds");
@@ -2408,6 +2428,7 @@ description = "Builds the product."
             name: "Impostor".into(),
             role: "Shadow CEO".into(),
             description: None,
+            tools: Vec::new(),
         });
 
         let roster = build_roster(&rec, &fx.deps, &[]).expect("roster builds");
@@ -2459,6 +2480,7 @@ description = "Builds the product."
             name: "Dana".into(),
             role: "Designer".into(),
             description: None,
+            tools: Vec::new(),
         });
         pool.ensure(&rec, &fx.deps).await.expect("second ensure");
 
@@ -3493,6 +3515,7 @@ description = "Builds the product."
             name: "Jamie".into(),
             role: "Growth Lead".into(),
             description: None,
+            tools: Vec::new(),
         });
         live_store.save(&updated).await.unwrap();
 
@@ -4322,6 +4345,7 @@ description = "Builds the product."
             name: "Jamie".into(),
             role: "Growth Lead".into(),
             description: None,
+            tools: Vec::new(),
         });
         let live_store = Arc::new(LiveStore::default());
         live_store.save(&rec).await.unwrap();

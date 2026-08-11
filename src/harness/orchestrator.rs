@@ -1549,13 +1549,50 @@ pub fn delegation_tools(
 pub struct AddAgentTool {
     company: CompanyId,
     store: Arc<dyn CompanyStore>,
+    /// The agent doing the minting — always the company orchestrator, since
+    /// this tool is only ever wired onto it (issue #619, and see [`new`]).
+    /// Carried for the audit line, not for a decision.
+    minter: String,
+    /// The minting agent's own **effective** grant, already resolved through
+    /// `agent_effective_grants` by the caller. A minted teammate is never wider
+    /// than this (issue #619).
+    minter_grants: Vec<String>,
 }
 
 impl AddAgentTool {
     /// Builds the tool over the company id and its store handle
     /// ([`HarnessDeps::store`](crate::harness::HarnessDeps::store)).
-    pub fn new(company: CompanyId, store: Arc<dyn CompanyStore>) -> Self {
-        Self { company, store }
+    /// Builds the tool over the company id, its store handle, and the minting
+    /// agent's id + effective grant.
+    ///
+    /// # Why the minter's grant is a parameter rather than a lookup
+    ///
+    /// It is already resolved where this is constructed: `build_agent` receives
+    /// `grants: &[String]` — the agent's effective grant, intersected against
+    /// `[tools].allow` — and wires this tool inside its `if is_orchestrator`
+    /// branch. So the value is in that stack frame; re-deriving it here would be
+    /// a second source of truth for the same question.
+    ///
+    /// # "The minting agent" has exactly one answer, by construction
+    ///
+    /// Not a heuristic. `orchestrator_tools` is wired **only** onto the company
+    /// orchestrator — the depth-cap / no-re-delegation invariant (issue #178),
+    /// pinned by contract test — so a dispatched teammate never holds this tool
+    /// and delegation cannot nest. There is no case where "whose grant?" is
+    /// ambiguous, and a later change that gave a sub-agent this tool would break
+    /// that contract test first.
+    pub fn new(
+        company: CompanyId,
+        store: Arc<dyn CompanyStore>,
+        minter: String,
+        minter_grants: Vec<String>,
+    ) -> Self {
+        Self {
+            company,
+            store,
+            minter,
+            minter_grants,
+        }
     }
 }
 
@@ -1637,11 +1674,49 @@ impl Tool for AddAgentTool {
                 "A teammate named \"{name}\" already exists. Pick a different name, or remove the existing one first."
             )));
         }
+        // Issue #619: a model-minted teammate is no wider than the agent that
+        // minted it.
+        //
+        // Before this it was minted at the company's full `[tools].allow`, which
+        // is the same defect #619 names for operator-added teammates arriving by
+        // an easier route: an operator has to act, whereas a model can call this
+        // tool — which is `Reach::Nothing`, sits in `INTRINSIC_TOOLS`, and never
+        // parks for approval.
+        //
+        // An EMPTY list is stored when the minter's grant is not actually
+        // narrower than the company's, because empty means "the company's
+        // standard grant" (#264) and that is the honest encoding of "nothing was
+        // narrowed". It also keeps such a teammate tracking `[tools].allow` if
+        // the company later widens it, exactly as before this change — so the
+        // only companies whose behaviour moves are the ones where the
+        // orchestrator really is scoped.
+        let allow = &record.manifest.tools.allow;
+        let narrowed = grants_are_narrower(&self.minter_grants, allow);
+        let tools = if narrowed {
+            self.minter_grants.clone()
+        } else {
+            Vec::new()
+        };
+        if narrowed {
+            // The operator-visible consequence of a silent change: a teammate
+            // that quietly cannot do something produces a confusing failure far
+            // from its cause, so the narrowing is recorded where someone
+            // debugging "why can't my new teammate do X" will find it.
+            tracing::info!(
+                company = %self.company,
+                minter = %self.minter,
+                teammate = %name,
+                grant = ?tools,
+                company_allow = ?allow,
+                "[add_agent] minted teammate narrowed to the minting agent's own grant (issue #619)"
+            );
+        }
         let agent = OverlayAgent {
             id: generate_id(),
             name: name.clone(),
             role: role.clone(),
             description,
+            tools,
         };
         record.overlay_agents.push(agent);
         self.store.save(&record).await?;
@@ -1650,6 +1725,26 @@ impl Tool for AddAgentTool {
             "Added {name} as {role} to the team. They'll be reachable as a teammate starting next turn."
         )))
     }
+}
+
+/// Is `grants` genuinely narrower than the company's `allow` (issue #619)?
+///
+/// Answers the only question the mint needs: **did anything actually get
+/// narrowed?** If not, the minted teammate stores an empty list and keeps
+/// inheriting, which is byte-for-byte the pre-#619 behaviour.
+///
+/// Deliberately a *set* comparison rather than a resolution: `agent_effective_grants`
+/// has already intersected `grants` against `allow`, so `grants` cannot contain
+/// anything `allow` does not. What is left to ask is whether it contains
+/// **less** — and order and duplicates are not part of that question, which is
+/// why this compares membership rather than the vectors.
+///
+/// An empty `grants` means the minter itself inherits, so nothing is narrower.
+fn grants_are_narrower(grants: &[String], allow: &[String]) -> bool {
+    if grants.is_empty() {
+        return false;
+    }
+    allow.iter().any(|a| !grants.contains(a))
 }
 
 // ---------------------------------------------------------------------------
@@ -1685,6 +1780,11 @@ pub fn orchestrator_tools(
     store: Arc<dyn CompanyStore>,
     workflow_refs: WorkflowRefQueue,
     run_outputs: RunOutputCache,
+    // The orchestrator's own id and effective grant, so `add_agent` cannot mint
+    // a teammate wider than the agent minting it (issue #619). Documented on
+    // `AddAgentTool::new`, which is where the argument for it lives.
+    minter: String,
+    minter_grants: Vec<String>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(QueryCompanyTool::new(
         company.clone(),
@@ -1721,7 +1821,12 @@ pub fn orchestrator_tools(
         events,
         workflow_refs,
     )));
-    tools.push(Box::new(AddAgentTool::new(company, store)));
+    tools.push(Box::new(AddAgentTool::new(
+        company,
+        store,
+        minter,
+        minter_grants,
+    )));
     tools
 }
 
@@ -4164,6 +4269,7 @@ name = "Morning"
             name: "Fact Fetcher".to_string(),
             role: "Researcher".to_string(),
             description: None,
+            tools: Vec::new(),
         });
         let store: Arc<dyn CompanyStore> = Arc::new(MemStore::seeded(record));
 
@@ -4275,7 +4381,12 @@ name = "Morning"
     async fn add_agent_tool_persists_an_overlay_teammate() {
         let company = CompanyId::new("acme");
         let store = Arc::new(MemStore::seeded(seeded_record(&company)));
-        let tool = AddAgentTool::new(company.clone(), store.clone());
+        let tool = AddAgentTool::new(
+            company.clone(),
+            store.clone(),
+            "ceo".to_string(),
+            Vec::new(),
+        );
 
         let result = tool
             .execute(json!({
@@ -4307,7 +4418,12 @@ name = "Morning"
     async fn add_agent_tool_requires_name_and_role() {
         let company = CompanyId::new("acme");
         let store = Arc::new(MemStore::seeded(seeded_record(&company)));
-        let tool = AddAgentTool::new(company.clone(), store.clone());
+        let tool = AddAgentTool::new(
+            company.clone(),
+            store.clone(),
+            "ceo".to_string(),
+            Vec::new(),
+        );
 
         assert!(
             tool.execute(json!({ "role": "Growth Lead" }))
@@ -4330,7 +4446,7 @@ name = "Morning"
     async fn add_agent_tool_reports_company_not_found() {
         let company = CompanyId::new("ghost");
         let store: Arc<dyn CompanyStore> = Arc::new(MemStore::default());
-        let tool = AddAgentTool::new(company, store);
+        let tool = AddAgentTool::new(company, store, "ceo".to_string(), Vec::new());
 
         let err = tool
             .execute(json!({ "name": "Jamie", "role": "Growth Lead" }))
@@ -4453,6 +4569,8 @@ name = "Morning"
             Arc::new(MemStore::default()),
             WorkflowRefQueue::default(),
             RunOutputCache::default(),
+            "ceo".to_string(),
+            Vec::new(),
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         // Six before #186; `assign_task` + `review_task` made eight; #418's

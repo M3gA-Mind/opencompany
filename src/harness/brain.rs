@@ -4518,6 +4518,7 @@ members = ["engineer"]
             name: "Nova".into(),
             role: "Growth".into(),
             description: None,
+            tools: Vec::new(),
         });
         tasks
             .upsert(&CompanyId::new("acme"), &card("t1", "nova"))
@@ -4844,6 +4845,7 @@ members = ["eng1", "eng2"]
                 name: "Cto".to_string(),
                 role: "CTO".to_string(),
                 description: None,
+                tools: Vec::new(),
             }],
             overlay_desk_members: vec![crate::ports::types::OverlayDeskMember {
                 desk_id: "eng".to_string(),

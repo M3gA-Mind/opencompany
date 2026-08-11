@@ -177,19 +177,34 @@ pub(super) struct AgentDeskDto {
 
 /// The tool globs an agent *asks* for, resolved identically for every reader.
 ///
-/// A manifest teammate's `[[agent]].tools` line; an **empty** list for an
-/// overlay teammate, which mirrors `harness::overlay_agent_to_manifest` — and
-/// which means "the company's standard grant", not "no tools".
+/// A manifest teammate's `[[agent]].tools` line, or an overlay teammate's own
+/// `tools` (issue #619) — in both cases an **empty** list means "the company's
+/// standard grant", not "no tools".
+///
+/// # Lockstep with the harness
+///
+/// This must return what `harness::overlay_agent_to_manifest` puts on the
+/// projected `ManifestAgent`, because the two are the same value reached by two
+/// paths: this one renders the teammate's grant in the console, that one decides
+/// what the agent is actually built with. If they drift, the console shows a
+/// grant the harness does not honour — the precise failure #264 exists to
+/// prevent, and the reason #619 asks for them to move together.
+///
+/// Before #619 both sides hardcoded empty for an overlay teammate, so they
+/// agreed by accident rather than by construction; now they agree because they
+/// read the same field.
 ///
 /// Its callers have already established that `agent_id` is on the roster, so a
-/// miss here can only be the overlay half.
+/// manifest miss is the overlay half rather than an unknown teammate.
 pub(super) fn requested_grants(record: &CompanyRecord, agent_id: &str) -> Vec<String> {
+    if let Some(agent) = record.manifest.agents.iter().find(|a| a.id == agent_id) {
+        return agent.tools.clone();
+    }
     record
-        .manifest
-        .agents
+        .overlay_agents
         .iter()
-        .find(|agent| agent.id == agent_id)
-        .map(|agent| agent.tools.clone())
+        .find(|a| a.id == agent_id)
+        .map(|a| a.tools.clone())
         .unwrap_or_default()
 }
 
