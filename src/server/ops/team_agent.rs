@@ -196,7 +196,7 @@ pub(super) struct AgentDeskDto {
 ///
 /// Its callers have already established that `agent_id` is on the roster, so a
 /// manifest miss is the overlay half rather than an unknown teammate.
-pub(super) fn requested_grants(record: &CompanyRecord, agent_id: &str) -> Vec<String> {
+pub(crate) fn requested_grants(record: &CompanyRecord, agent_id: &str) -> Vec<String> {
     if let Some(agent) = record.manifest.agents.iter().find(|a| a.id == agent_id) {
         return agent.tools.clone();
     }

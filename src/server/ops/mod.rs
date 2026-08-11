@@ -42,7 +42,11 @@ pub mod team;
 /// detail read (identity, tier, **resolved** tool grants, desks) and the edit
 /// for the fields the console owns. Attached to [`team`]'s existing
 /// `/team/{agent_id}` route rather than merged as its own. See [`team_agent`].
-mod team_agent;
+// `pub(crate)` rather than private so the harness-side lockstep test (issue
+// #619) can compare `requested_grants` against `overlay_agent_to_manifest`
+// directly. The two must return the same grant for an overlay teammate, and a
+// test that re-implemented one of them would not be checking anything.
+pub(crate) mod team_agent;
 pub mod usage;
 pub mod workflows;
 pub mod workspace;

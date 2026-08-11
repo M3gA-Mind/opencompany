@@ -2086,6 +2086,107 @@ mod tests {
         ChunkAddr, ChunkHit, ChunkMeta, CompanySummary, ContextChunk, LedgerEntry,
     };
 
+    /// The harness projection and the console projection agree about an overlay
+    /// teammate's grant (issue #619).
+    ///
+    /// The lockstep the issue asks for, asserted rather than assumed. These are
+    /// the same value reached two ways: `overlay_agent_to_manifest` decides what
+    /// the agent is **built with**, `team_agent::requested_grants` decides what
+    /// the console **shows**. If they drift, the console displays a scope the
+    /// harness is not enforcing — the exact failure #264 exists to prevent.
+    ///
+    /// Before #619 they agreed by accident: both hardcoded an empty list. Now
+    /// they agree because they read one field, and this pins that they keep
+    /// doing so.
+    #[test]
+    fn the_harness_and_the_console_agree_about_an_overlay_teammates_grant() {
+        use crate::ports::types::CompanyRecord;
+
+        for tools in [
+            vec![],
+            vec!["web.*".to_string()],
+            vec!["a".to_string(), "b".to_string()],
+        ] {
+            let overlay = OverlayAgent {
+                id: "researcher".to_string(),
+                name: "Researcher".to_string(),
+                role: "Research".to_string(),
+                description: None,
+                tools: tools.clone(),
+            };
+            let record = CompanyRecord {
+                id: CompanyId::new("acme"),
+                manifest: toml::from_str("[company]\nname = \"Acme\"\n").expect("manifest"),
+                ledger: Vec::new(),
+                lifecycle: "running".to_string(),
+                overlay_agents: vec![overlay.clone()],
+                overlay_desk_members: Vec::new(),
+                overlay_desk_order: Vec::new(),
+                overlay_desks: Vec::new(),
+                overlay_workflows: Vec::new(),
+                overlay_budgets: Vec::new(),
+                disabled_workflows: Vec::new(),
+                template_provenance: None,
+            };
+
+            assert_eq!(
+                overlay_agent_to_manifest(&overlay).tools,
+                crate::server::ops::team_agent::requested_grants(&record, "researcher"),
+                "the harness builds a teammate with a different grant from the one \
+                 the console renders for it"
+            );
+        }
+    }
+
+    fn overlay_with_tools(tools: &[&str]) -> OverlayAgent {
+        OverlayAgent {
+            id: "researcher".to_string(),
+            name: "Researcher".to_string(),
+            role: "Research".to_string(),
+            description: None,
+            tools: tools.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    /// Scoping an overlay teammate moves the overlay fingerprint (issue #619).
+    ///
+    /// **This is the assertion that keeps the feature from being a no-op**, and
+    /// it guards a failure that is worse than the hole #619 closes. The roster
+    /// is cached and rebuilt only when a fingerprint moves, so a `tools` value
+    /// that this function ignored would be written, persisted, returned as
+    /// `200` and rendered in the console — while the teammate went on holding
+    /// **the company's widest grant** until the process restarted. The console
+    /// would say "read-only" and the agent would not be.
+    ///
+    /// Nothing else in the change would fail: the field would round-trip, both
+    /// readers would agree, and every other test here would pass.
+    #[test]
+    fn scoping_an_overlay_teammate_moves_the_overlay_fingerprint() {
+        let inherits = overlay_fingerprint(&[overlay_with_tools(&[])]);
+        let scoped = overlay_fingerprint(&[overlay_with_tools(&["web.*"])]);
+        assert_ne!(
+            inherits, scoped,
+            "narrowing a teammate must rebuild the roster, or the console shows a \
+             scope the harness is not enforcing"
+        );
+
+        // A different scope is a different fingerprint, and so is a wider one:
+        // the roster must be rebuilt when a teammate is re-scoped, not only when
+        // it is scoped for the first time.
+        let other = overlay_fingerprint(&[overlay_with_tools(&["docs.*"])]);
+        let wider = overlay_fingerprint(&[overlay_with_tools(&["web.*", "docs.*"])]);
+        assert_ne!(scoped, other);
+        assert_ne!(scoped, wider);
+
+        // Order is part of the value and length is folded in, so neither a
+        // reorder nor a concatenation can collide.
+        let reordered = overlay_fingerprint(&[overlay_with_tools(&["docs.*", "web.*"])]);
+        assert_ne!(wider, reordered);
+        let split = overlay_fingerprint(&[overlay_with_tools(&["a", "b"])]);
+        let joined = overlay_fingerprint(&[overlay_with_tools(&["ab"])]);
+        assert_ne!(split, joined);
+    }
+
     /// In-memory `ContextStore` so `OcMemory` has somewhere to land.
     #[derive(Default)]
     struct MockContext {

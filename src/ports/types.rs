@@ -3831,6 +3831,39 @@ mod test {
         );
     }
 
+    /// An overlay teammate's `tools` is additive on the wire (issue #619).
+    ///
+    /// A record written before the field existed must load as "inherit", and a
+    /// teammate that inherits must serialise exactly as it did before — no new
+    /// key. Otherwise every existing company record changes shape on its next
+    /// save for a feature none of them use.
+    #[test]
+    fn an_overlay_teammates_tools_field_is_serde_additive() {
+        let legacy = r#"{"id":"a1","name":"Ana","role":"Analyst"}"#;
+        let parsed: OverlayAgent = serde_json::from_str(legacy).expect("legacy overlay agent");
+        assert!(
+            parsed.tools.is_empty(),
+            "a teammate written before scoping existed must load as inheriting"
+        );
+
+        // Inheriting teammates emit no `tools` key at all.
+        let json = serde_json::to_string(&parsed).expect("serialize");
+        assert!(
+            !json.contains("tools"),
+            "an inheriting teammate must round-trip byte-identically: {json}"
+        );
+
+        // A scoped one does, and survives the round trip.
+        let scoped = OverlayAgent {
+            tools: vec!["web.*".to_string()],
+            ..parsed
+        };
+        let back: OverlayAgent =
+            serde_json::from_str(&serde_json::to_string(&scoped).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(back.tools, vec!["web.*".to_string()]);
+    }
+
     /// The persisted overlay blob round-trips the desk-order collection.
     #[test]
     fn overlay_blob_round_trips_desk_order() {

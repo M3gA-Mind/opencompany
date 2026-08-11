@@ -4377,6 +4377,104 @@ name = "Morning"
         }
     }
 
+    fn record_allowing(id: &CompanyId, allow: &[&str]) -> CompanyRecord {
+        let list = allow
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let manifest = toml::from_str(&format!(
+            "[company]\nname = \"Acme\"\n[tools]\nallow = [{list}]\n"
+        ))
+        .expect("valid manifest");
+        CompanyRecord {
+            manifest,
+            ..seeded_record(id)
+        }
+    }
+
+    async fn mint(store: &Arc<MemStore>, company: &CompanyId, grants: &[&str]) -> Vec<String> {
+        let tool = AddAgentTool::new(
+            company.clone(),
+            store.clone(),
+            "ceo".to_string(),
+            grants.iter().map(|g| g.to_string()).collect(),
+        );
+        let result = tool
+            .execute(json!({ "name": "Minted", "role": "Analyst" }))
+            .await
+            .expect("execute");
+        assert!(!result.is_error, "mint should succeed");
+        let record = store.record.lock().unwrap().clone().expect("record");
+        record.overlay_agents[0].tools.clone()
+    }
+
+    /// A model-minted teammate is no wider than the agent that minted it
+    /// (issue #619).
+    ///
+    /// **The discriminating case is an orchestrator genuinely narrower than
+    /// `[tools].allow`.** With a `*`-granted orchestrator, "minted equals the
+    /// minter's grant" and "minted equals the company allow" are the same
+    /// assertion, so a test built on that company would pass whether or not the
+    /// narrowing existed at all — it would look like coverage and prove nothing.
+    /// That is the same vacuity that hollowed out a tier-list assertion in #562
+    /// once an adjacent merge made two lists identical.
+    #[tokio::test]
+    async fn a_minted_teammate_is_no_wider_than_the_minting_agent() {
+        let company = CompanyId::new("acme");
+
+        // The case that discriminates: the company allows two families, the
+        // orchestrator holds one.
+        let store = Arc::new(MemStore::seeded(record_allowing(
+            &company,
+            &["web.*", "code.*"],
+        )));
+        let minted = mint(&store, &company, &["web.*"]).await;
+        assert_eq!(
+            minted,
+            vec!["web.*".to_string()],
+            "a minted teammate must not hold `code.*`, which the agent that \
+             minted it does not hold"
+        );
+
+        // The no-op case: the minter already holds everything the company
+        // allows, so nothing was narrowed and the teammate inherits — empty,
+        // which is byte-for-byte the pre-#619 behaviour and keeps the teammate
+        // tracking `[tools].allow` if the company later widens it.
+        let store = Arc::new(MemStore::seeded(record_allowing(&company, &["web.*"])));
+        let minted = mint(&store, &company, &["web.*"]).await;
+        assert!(
+            minted.is_empty(),
+            "nothing was narrowed, so the teammate should inherit rather than \
+             pin today's allow-list"
+        );
+
+        // An orchestrator that itself inherits mints an inheriting teammate.
+        let store = Arc::new(MemStore::seeded(record_allowing(&company, &["web.*"])));
+        assert!(mint(&store, &company, &[]).await.is_empty());
+    }
+
+    /// The predicate behind the mint, at its boundaries.
+    #[test]
+    fn grants_are_narrower_only_when_something_is_actually_missing() {
+        let allow = vec!["web.*".to_string(), "code.*".to_string()];
+        assert!(grants_are_narrower(&["web.*".to_string()], &allow));
+        assert!(!grants_are_narrower(&allow.clone(), &allow));
+        // Order and duplicates are not part of the question.
+        assert!(!grants_are_narrower(
+            &[
+                "code.*".to_string(),
+                "web.*".to_string(),
+                "web.*".to_string()
+            ],
+            &allow
+        ));
+        // An inheriting minter narrows nothing.
+        assert!(!grants_are_narrower(&[], &allow));
+        // A company that allows nothing cannot be narrowed past.
+        assert!(!grants_are_narrower(&["web.*".to_string()], &[]));
+    }
+
     #[tokio::test]
     async fn add_agent_tool_persists_an_overlay_teammate() {
         let company = CompanyId::new("acme");
