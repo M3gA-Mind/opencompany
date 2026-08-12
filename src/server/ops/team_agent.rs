@@ -365,6 +365,10 @@ async fn agent_detail(
 /// working exactly as before, and adding this field must not quietly take an
 /// existing capability away from members.
 ///
+/// Being conditional is also what fixes its **position**: it runs after the
+/// `409`/`404` checks, so an unknown id answers `404` whether or not the body
+/// carried `tools`. See the comment at the check itself.
+///
 /// Narrow-only-for-members was considered and rejected: it makes the scope a
 /// one-way ratchet, so a teammate scoped too tightly could never be loosened by
 /// anyone, and the only way back would be delete-and-recreate — which orphans
@@ -377,12 +381,6 @@ async fn edit_agent(
     Path(AgentPath { agent_id }): Path<AgentPath>,
     Json(body): Json<EditAgent>,
 ) -> Result<Json<AgentDetailDto>, Response> {
-    // Authority before the write lock: a refused edit must not hold the lock,
-    // and must not have looked at the record either.
-    if body.tools.is_some() {
-        require_admin(&headers, &state, &company.runtime).await?;
-    }
-
     // Serialize with every other write to `overlay_agents`, so a console edit
     // and a concurrent `add_agent` cannot clobber one another's roster.
     let write_lock = company_write_lock(company.id());
@@ -411,6 +409,30 @@ async fn edit_agent(
             "teammate {agent_id}"
         )))
         .into_response());
+    }
+
+    // Authority **after** existence, and this ordering is forced rather than
+    // preferred (review of #745).
+    //
+    // The check is conditional on `tools`, so putting it first would make one
+    // route give two answers about whether a teammate exists: `{"name": "x"}`
+    // on an unknown id would 404 while `{"tools": […]}` on the same id would
+    // 403. Nothing about an unrelated field should decide that, and the
+    // non-`tools` path cannot be moved to match — a name edit is member-open
+    // and has no authority check to run first. So this is the only order in
+    // which the two paths agree.
+    //
+    // The usual reason to authorise first — refusing to confirm a resource
+    // exists — does not apply: `GET {scope}/team/{agent_id}` is open to any
+    // signed-in member and already 404s on an unknown id, so ordering 403
+    // ahead of 404 here would hide nothing from the very caller it would
+    // inconvenience.
+    //
+    // Deliberately unlike `set_budget`, which authorises first: that route is
+    // admin-only in full, so admin-first is self-consistent there. This one is
+    // admin-only *per field*, which is what makes the ordering load-bearing.
+    if body.tools.is_some() {
+        require_admin(&headers, &state, &company.runtime).await?;
     }
 
     let name = trimmed_field(body.name.as_deref(), "name").map_err(|e| e.into_response())?;
@@ -1411,6 +1433,59 @@ members = ["writer", "ceo"]
             strings(&unchanged["tools"]["requested"]),
             vec!["workspace"],
             "the scope an admin set must survive both refusals: {unchanged}"
+        );
+    }
+
+    /// **Review of #745.** An unknown id answers the same way whether or not
+    /// the body carries `tools`.
+    ///
+    /// The invariant, stated independently of which ordering is "right": one
+    /// route must not give two answers about whether a teammate exists,
+    /// decided by an unrelated field. Putting the conditional admin check
+    /// before the existence lookup did exactly that — `{"name": "x"}` on an
+    /// unknown id returned `404` while `{"tools": […]}` on the same id
+    /// returned `403`.
+    ///
+    /// Driven as a **member**, because that is the only actor for whom the two
+    /// orderings differ: an admin passes the check either way and would see
+    /// `404` regardless, so a test written as an admin would pass against the
+    /// broken ordering too.
+    #[tokio::test]
+    async fn an_unknown_teammate_is_a_404_whether_or_not_tools_are_sent() {
+        let home_dir = home();
+        let state = state_with_manifest(home_dir.path(), ROSTER).await;
+        crate::server::test_support::seed_fixed_member(&state, "acme").await;
+
+        let uri = "/api/v1/company/team/nobody";
+        let member = || crate::server::test_support::member_cookie("acme");
+
+        let (without_tools, _) = send_as(
+            &state,
+            "PATCH",
+            uri,
+            Some(json!({"role": "Ghost"})),
+            member(),
+        )
+        .await;
+        let (with_tools, _) = send_as(
+            &state,
+            "PATCH",
+            uri,
+            Some(json!({"tools": ["workspace"]})),
+            member(),
+        )
+        .await;
+
+        assert_eq!(
+            with_tools, without_tools,
+            "an unrelated field must not change whether a teammate is reported \
+             as existing"
+        );
+        assert_eq!(
+            with_tools,
+            StatusCode::NOT_FOUND,
+            "and the shared answer is 404: existence is already readable by any \
+             member through GET, so 403-first would hide nothing"
         );
     }
 
